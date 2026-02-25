@@ -4,121 +4,132 @@ import textwrap
 from pathlib import Path
 from PIL import Image, ImageFilter, ImageDraw, ImageFont, ImageEnhance
 
-# ── Константы ─────────────────────────────────────────────────────────────────
+# ── Размеры ──────────────────────────────────────────────────────────────────
 CANVAS_W = 2160
 CANVAS_H = 1080
 SLIDE_W  = 1080
 SLIDE_H  = 1080
 
 PHOTO_SZ = 864
-PHOTO_X  = SLIDE_W - PHOTO_SZ // 2    # 648
+PHOTO_X  = SLIDE_W - PHOTO_SZ // 2    # 648 (начало фото)
 PHOTO_Y  = (CANVAS_H - PHOTO_SZ) // 2 # 108
 CORNER_R = 50
 
-# Центр текста на 1-м слайде (левая часть)
+# Левая зона (артист/трек): 0..PHOTO_X
 ARTIST_CX = PHOTO_X // 2
 
-def shadow_centered(draw, text, font, color, cx, y):
-    """Рисует текст с небольшой тенью для читаемости"""
-    bbox = draw.textbbox((0, 0), text, font=font)
-    tw = bbox[2] - bbox[0]
-    tx = cx - tw // 2
-    # Мягкая тень
-    draw.text((tx+2, y+2), text, font=font, fill=(0, 0, 0, 80))
-    # Основной текст
-    draw.text((tx, y), text, font=font, fill=color)
+# Правая зона (текст трека): 
+# Фото заканчивается на 648 + 864 = 1512. Край холста = 2160.
+# Центр пустой области: (1512 + 2160) // 2 = 1836
+FREE_ZONE_CX = 1836
+LYRICS_PAD = 40 
 
-def get_font(size):
-    # Пытаемся загрузить font.ttf из корня проекта
-    font_path = "font.ttf"
+# ── Шрифты ───────────────────────────────────────────────────────────────────
+_HERE = Path(__file__).parent
+
+def get_font(size: int):
+    custom = _HERE / "font.ttf"
     try:
-        if os.path.exists(font_path):
-            return ImageFont.truetype(font_path, size)
+        if custom.exists():
+            return ImageFont.truetype(str(custom), size)
         return ImageFont.load_default()
     except:
         return ImageFont.load_default()
 
+TEXT_COLORS = {
+    "white":  (255, 255, 255),
+    "yellow": (255, 225, 60),
+    "cyan":   (60, 220, 255),
+    "pink":   (255, 80, 190),
+    "orange": (255, 150, 40),
+    "red":    (255, 60, 60),
+    "green":  (60, 220, 120),
+}
+
+# ── Вспомогательные функции ───────────────────────────────────────────────────
+def shadow_centered(draw, text, fnt, color, cx, y):
+    bb = draw.textbbox((0,0), text, font=fnt)
+    w  = bb[2] - bb[0]
+    tx = cx - w // 2
+    # Тень
+    draw.text((tx+2, y+2), text, font=fnt, fill=(0,0,0,120))
+    # Текст
+    draw.text((tx, y), text, font=fnt, fill=color)
+
 class CarouselGenerator:
-    def __init__(self):
-        pass
+    def __init__(self, settings: dict):
+        """Исправлено: теперь принимает настройки, как просит bot.py"""
+        self.s = settings
 
-    def generate(self, photo_bytes, artist, track, lyrics, settings):
-        # 1. Загрузка фото
-        img = Image.open(io.BytesIO(photo_bytes)).convert("RGBA")
+    def make_carousel(self, photo_bytes, artist, track, lyrics, original_filename="image.jpg"):
+        s     = self.s
+        blur  = s.get("blur", 22)
+        color = TEXT_COLORS.get(s.get("text_color", "white"), (255,255,255))
+        sz1   = int(s.get("font_size_slide1", 78))
+        sz2   = int(s.get("font_size_slide2", 44))
+
+        photo = Image.open(io.BytesIO(photo_bytes)).convert("RGB")
         
-        # Обрезка в квадрат
-        w, h = img.size
+        # 1. Квадратное фото
+        w, h = photo.size
         side = min(w, h)
-        img = img.crop(((w-side)//2, (h-side)//2, (w+side)//2, (h+side)//2))
-        img = img.resize((PHOTO_SZ, PHOTO_SZ), Image.Resampling.LANCZOS)
+        sq = photo.crop(((w-side)//2, (h-side)//2, (w+side)//2, (h+side)//2))
+        sq = sq.resize((PHOTO_SZ, PHOTO_SZ), Image.LANCZOS)
 
-        # Скругление углов
+        # 2. Фон (Размытие и Яркость)
+        bg = sq.resize((CANVAS_W, CANVAS_H), Image.LANCZOS)
+        if blur > 0:
+            bg = bg.filter(ImageFilter.GaussianBlur(radius=blur))
+        
+        # ИСПРАВЛЕНО: Увеличил яркость с 0.38 до 0.7, чтобы не было слишком темно
+        bg = ImageEnhance.Brightness(bg).enhance(0.7)
+        canvas = bg.convert("RGBA")
+
+        # 3. Наложение фото со скруглением
         mask = Image.new("L", (PHOTO_SZ, PHOTO_SZ), 0)
-        draw_m = ImageDraw.Draw(mask)
-        draw_m.rounded_rectangle((0, 0, PHOTO_SZ, PHOTO_SZ), CORNER_R, fill=255)
-        img.putalpha(mask)
-
-        # 2. Создание фона (размытие)
-        # Делаем фон из исходного фото
-        bg = img.copy().resize((CANVAS_W, CANVAS_H), Image.Resampling.LANCZOS)
-        bg = bg.filter(ImageFilter.GaussianBlur(settings.get("blur", 20)))
+        ImageDraw.Draw(mask).rounded_rectangle([0,0,PHOTO_SZ,PHOTO_SZ], radius=CORNER_R, fill=255)
         
-        # Затемняем фон чуть-чуть, чтобы текст читался, но фото оставалось ярким
-        enhancer = ImageEnhance.Brightness(bg.convert("RGB"))
-        bg = enhancer.enhance(0.8).convert("RGBA")
+        sq_rgba = sq.convert("RGBA")
+        sq_rgba.putalpha(mask)
+        canvas.paste(sq_rgba, (PHOTO_X, PHOTO_Y), sq_rgba)
         
-        # Основной холст
-        canvas = bg
-        # Накладываем само фото в центр (на стык)
-        canvas.paste(img, (PHOTO_X, PHOTO_Y), img)
-        canvas = canvas.convert("RGB")
+        # ИСПРАВЛЕНО: Удален черный оверлей Image.new("RGBA", ... 150), который затемнял 2-й слайд
+        
+        final_cv = canvas.convert("RGB")
+        draw = ImageDraw.Draw(final_cv)
 
-        # 3. Настройка рисования
-        draw = ImageDraw.Draw(canvas)
-        color = settings.get("text_color", "white")
-        sz1 = settings.get("font_size_slide1", 70)
-        sz2 = settings.get("font_size_slide2", 40)
-
-        # 4. Текст на Слайде 1 (Артист и Трек)
+        # 4. Слайд 1: Текст (левая часть)
         fnt_a = get_font(sz1)
         fnt_t = get_font(max(14, sz1 - 20))
         
-        gap = 20
-        total_h = sz1 + gap + (sz1-20)
-        start_y = (CANVAS_H - total_h) // 2
-        
-        shadow_centered(draw, artist, fnt_a, color, ARTIST_CX, start_y)
-        shadow_centered(draw, track, fnt_t, color, ARTIST_CX, start_y + sz1 + gap)
+        total_h = sz1 + 24 + (sz1-20)
+        y = (CANVAS_H - total_h) // 2
+        shadow_centered(draw, artist, fnt_a, color, ARTIST_CX, y)
+        shadow_centered(draw, track, fnt_t, color, ARTIST_CX, y + sz1 + 24)
 
-        # 5. Текст на Слайде 2 (в пустой области справа)
-        # Конец фото: 648 (PHOTO_X) + 864 (PHOTO_SZ) = 1512
-        # Правый край: 2160
-        # Центр пустой зоны: 1512 + (2160 - 1512) // 2 = 1836
-        FREE_ZONE_CX = 1836 
-        
+        # 5. Слайд 2: Текст (правая пустая область)
         fnt_l = get_font(sz2)
+        # Ограничиваем ширину текста для узкой зоны (ширина зоны ~600px)
+        lines = []
+        for line in lyrics.split('\n'):
+            lines.extend(textwrap.wrap(line, width=22))
         
-        # Разбиваем текст на строки
-        all_lines = []
-        for block in lyrics.split('\n'):
-            if not block.strip():
-                all_lines.append("")
-                continue
-            all_lines.extend(textwrap.wrap(block, width=22)) # Ограничение ширины
+        line_h = sz2 + 15
+        cur_y = (CANVAS_H - (len(lines) * line_h)) // 2
+        
+        for line in lines:
+            # Центрируем внутри FREE_ZONE_CX (1836px)
+            shadow_centered(draw, line, fnt_l, color, FREE_ZONE_CX, cur_y)
+            cur_y += line_h
 
-        line_h = sz2 + 12
-        # Ограничиваем количество строк, чтобы не вышли за экран
-        max_lines = CANVAS_H // line_h - 2
-        display_lines = all_lines[:max_lines]
+        # 6. Нарезка
+        stem = Path(original_filename).stem
+        s1 = final_cv.crop((0, 0, SLIDE_W, SLIDE_H))
+        s2 = final_cv.crop((SLIDE_W, 0, CANVAS_W, SLIDE_H))
         
-        current_y = (CANVAS_H - (len(display_lines) * line_h)) // 2
-        
-        for line in display_lines:
-            if line.strip():
-                shadow_centered(draw, line, fnt_l, color, FREE_ZONE_CX, current_y)
-            current_y += line_h
+        def to_bytes(im):
+            b = io.BytesIO()
+            im.save(b, "PNG")
+            return b.getvalue()
 
-        # 6. Сохранение
-        out = io.BytesIO()
-        canvas.save(out, format="JPEG", quality=95)
-        return out.getvalue()
+        return to_bytes(s1), to_bytes(s2), f"{stem}_1.png", f"{stem}_2.png"
