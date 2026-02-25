@@ -1,11 +1,3 @@
-"""
-TikTok Carousel Bot v6
-Исправлено:
-  - Размер шрифта меняется корректно (убран конфликт хендлеров)
-  - Шрифт берётся из font.ttf рядом со скриптом
-  - Текст трека центрирован на слайде 2
-"""
-
 import os
 import io
 import zipfile
@@ -17,9 +9,10 @@ from telegram.ext import (
 )
 from generator import CarouselGenerator
 
-# ── States ────────────────────────────────────────────────────────────────────
+# ── Состояния диалога ────────────────────────────────────────────────────────
 WAIT_ARTIST, WAIT_TRACK, WAIT_LYRICS = range(3)
 
+# Хранилище настроек и текущих данных
 user_settings: dict[int, dict] = {}
 user_state:    dict[int, dict] = {}
 
@@ -30,319 +23,180 @@ DEFAULT_SETTINGS = {
     "font_size_slide2": 44,
 }
 
-
 def get_s(uid: int) -> dict:
     if uid not in user_settings:
         user_settings[uid] = DEFAULT_SETTINGS.copy()
     return user_settings[uid]
 
-
-def settings_text(s: dict) -> str:
-    return (
-        "⚙️ *Настройки оформления:*\n\n"
-        f"Цвет текста: `{s['text_color']}`\n"
-        f"Размытие фона: `{s['blur']}`\n"
-        f"📏 Шрифт слайд 1 (артист/трек): `{s['font_size_slide1']}`\n"
-        f"📏 Шрифт слайд 2 (текст трека): `{s['font_size_slide2']}`\n\n"
-        "_Чтобы изменить размер шрифта — нажми кнопку и напиши число_"
-    )
-
-
-def settings_kb(s: dict) -> InlineKeyboardMarkup:
+def get_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🎨 Цвет текста", callback_data="S_color")],
-        [InlineKeyboardButton(f"📏 Размер слайд 1: {s['font_size_slide1']}", callback_data="S_sz1")],
-        [InlineKeyboardButton(f"📏 Размер слайд 2: {s['font_size_slide2']}", callback_data="S_sz2")],
-        [InlineKeyboardButton("💧 Размытие", callback_data="S_blur")],
-        [InlineKeyboardButton("✅ Закрыть", callback_data="S_close")],
+        [InlineKeyboardButton("🎨 Цвет текста", callback_data="set_color"),
+         InlineKeyboardButton("🌫 Размытие", callback_data="set_blur")],
+        [InlineKeyboardButton("📏 Размер (Слайд 1)", callback_data="size_1"),
+         InlineKeyboardButton("📏 Размер (Слайд 2)", callback_data="size_2")]
     ])
 
-
-# ── /start ────────────────────────────────────────────────────────────────────
-async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+# ── Команды ──────────────────────────────────────────────────────────────────
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🎵 *TikTok Carousel Bot*\n\n"
-        "Отправь фото (как документ для лучшего качества) → введи артиста, трек, текст.\n\n"
-        "/settings — настройки оформления\n"
-        "/cancel — отмена",
-        parse_mode="Markdown"
+        "👋 Привет! Я создаю карусели для TikTok.\n\n"
+        "📸 **Как работать:**\n"
+        "1. Отправь мне одно фото или ZIP-архив (до 20Мб).\n"
+        "2. Напиши Артиста, Трек и Текст.\n"
+        "3. Я пришлю готовые слайды или архив.\n\n"
+        "Настройки оформления: /settings",
+        reply_markup=get_keyboard()
     )
 
+async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    s = get_s(update.effective_user.id)
+    text = (f"⚙️ **Текущие настройки:**\n"
+            f"• Цвет: `{s['text_color']}`\n• Размытие: `{s['blur']}`\n"
+            f"• Шрифт 1: `{s['font_size_slide1']}`\n• Шрифт 2: `{s['font_size_slide2']}`")
+    await update.message.reply_text(text, reply_markup=get_keyboard(), parse_mode="Markdown")
 
-# ── /settings ─────────────────────────────────────────────────────────────────
-async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+# ── Обработка фото и архивов ──────────────────────────────────────────────────
+async def photo_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    s   = get_s(uid)
-    # Сбрасываем ожидание ввода если было
-    ctx.user_data.pop("size_key", None)
-    ctx.user_data.pop("size_msg_id", None)
-    await update.message.reply_text(
-        settings_text(s), parse_mode="Markdown", reply_markup=settings_kb(s)
-    )
-
-
-async def settings_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q   = update.callback_query
-    await q.answer()
-    uid = q.from_user.id
-    s   = get_s(uid)
-    d   = q.data
-
-    if d == "S_color":
-        colors = ["white","yellow","cyan","pink","orange","red","green"]
-        await q.edit_message_text("🎨 Выбери цвет текста:", reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton(c.capitalize(), callback_data=f"C_{c}") for c in colors[:4]],
-            [InlineKeyboardButton(c.capitalize(), callback_data=f"C_{c}") for c in colors[4:]],
-        ]))
-
-    elif d.startswith("C_"):
-        s["text_color"] = d[2:]
-        await q.edit_message_text(settings_text(s), parse_mode="Markdown", reply_markup=settings_kb(s))
-
-    elif d == "S_blur":
-        await q.edit_message_text("💧 Степень размытия:", reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("0", callback_data="B_0"),
-            InlineKeyboardButton("10", callback_data="B_10"),
-            InlineKeyboardButton("22", callback_data="B_22"),
-            InlineKeyboardButton("30", callback_data="B_30"),
-        ]]))
-
-    elif d.startswith("B_"):
-        s["blur"] = int(d[2:])
-        await q.edit_message_text(settings_text(s), parse_mode="Markdown", reply_markup=settings_kb(s))
-
-    elif d == "S_sz1":
-        ctx.user_data["size_key"] = "font_size_slide1"
-        await q.edit_message_text(
-            "📏 Введи размер шрифта для *слайда 1* (имя артиста + трек).\n"
-            "Рекомендую: `60`–`100`\n\n"
-            "Напиши число и отправь:",
-            parse_mode="Markdown"
-        )
-
-    elif d == "S_sz2":
-        ctx.user_data["size_key"] = "font_size_slide2"
-        await q.edit_message_text(
-            "📏 Введи размер шрифта для *слайда 2* (текст трека).\n"
-            "Рекомендую: `36`–`60`\n\n"
-            "Напиши число и отправь:",
-            parse_mode="Markdown"
-        )
-
-    elif d == "S_close":
-        await q.edit_message_text("✅ Настройки сохранены! Отправь фото для генерации.")
-
-
-# ── Обработка текста ВНЕ диалога (ввод размера шрифта) ───────────────────────
-async def text_outside_conv(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    key = ctx.user_data.get("size_key")
-
-    if not key:
-        await update.message.reply_text(
-            "Отправь фото чтобы начать 📸\nИли /settings для настроек."
-        )
-        return
-
-    text = update.message.text.strip()
-    try:
-        size = int(text)
-        if not (10 <= size <= 200):
-            raise ValueError
-    except ValueError:
-        await update.message.reply_text("⚠️ Введи число от 10 до 200:")
-        return
-
-    get_s(uid)[key] = size
-    ctx.user_data.pop("size_key", None)
-
-    label = "слайд 1 (артист/трек)" if key == "font_size_slide1" else "слайд 2 (текст трека)"
-    s = get_s(uid)
-    await update.message.reply_text(
-        f"✅ Размер шрифта ({label}): `{size}`\n\n"
-        f"Текущие размеры:\n"
-        f"Слайд 1: `{s['font_size_slide1']}` | Слайд 2: `{s['font_size_slide2']}`\n\n"
-        "Отправь фото для генерации или /settings для дальнейших настроек.",
-        parse_mode="Markdown"
-    )
-
-
-# ── Photo / document — начало диалога ─────────────────────────────────────────
-async def photo_received(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid   = update.effective_user.id
-    # Сбрасываем ожидание ввода размера если было
-    ctx.user_data.pop("size_key", None)
-
-    photo = update.message.photo[-1]
-    file  = await ctx.bot.get_file(photo.file_id)
-    buf   = io.BytesIO()
-    await file.download_to_memory(buf)
-    user_state[uid] = {
-        "photo": buf.getvalue(),
-        "original_filename": photo.file_unique_id + ".jpg"
-    }
-    await update.message.reply_text(
-        "✅ Фото получено!\n\n"
-        "💡 *Совет:* для оригинального качества отправляй как *файл* (скрепка → файл).\n\n"
-        "✏️ Напиши *имя артиста*:",
-        parse_mode="Markdown"
-    )
+    photo = await update.message.photo[-1].get_file()
+    user_state[uid] = {"mode": "single", "data": await photo.download_as_bytearray()}
+    await update.message.reply_text("👤 Введи имя артиста:")
     return WAIT_ARTIST
 
-
-async def document_received(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def document_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    ctx.user_data.pop("size_key", None)
     doc = update.message.document
-
-    if doc.file_name.lower().endswith((".jpg",".jpeg",".png",".webp")):
-        file = await ctx.bot.get_file(doc.file_id)
-        buf  = io.BytesIO()
-        await file.download_to_memory(buf)
-        user_state[uid] = {"photo": buf.getvalue(), "original_filename": doc.file_name}
-        await update.message.reply_text(
-            "✅ Фото получено!\n\n✏️ Напиши *имя артиста*:",
-            parse_mode="Markdown"
-        )
+    if doc.mime_type == 'application/zip' or doc.file_name.endswith('.zip'):
+        file = await doc.get_file()
+        user_state[uid] = {"mode": "batch", "data": await file.download_as_bytearray()}
+        await update.message.reply_text("📦 Обнаружен ZIP-архив.\n👤 Введи имя артиста для всей пачки:")
         return WAIT_ARTIST
+    else:
+        await update.message.reply_text("❌ Пожалуйста, отправь фото или .zip архив.")
 
-    if doc.file_name.lower().endswith(".zip"):
-        await update.message.reply_text("⏳ Получаю архив...")
-        file = await ctx.bot.get_file(doc.file_id)
-        buf  = io.BytesIO()
-        await file.download_to_memory(buf)
-        user_state[uid] = {"zip_buf": buf.getvalue(), "mode": "batch"}
-        await update.message.reply_text(
-            "✅ Архив получен!\n\n✏️ Напиши *имя артиста* (для всех фото):",
-            parse_mode="Markdown"
-        )
-        return WAIT_ARTIST
-
-    await update.message.reply_text("⚠️ Отправь фото (.jpg/.png) или архив (.zip)")
-    return ConversationHandler.END
-
-
-async def got_artist(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    user_state[uid]["artist"] = update.message.text.strip()
-    await update.message.reply_text("🎵 Напиши *название трека*:", parse_mode="Markdown")
+# ── Сбор данных ─────────────────────────────────────────────────────────────
+async def got_artist(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_state[update.effective_user.id]["artist"] = update.message.text
+    await update.message.reply_text("🎵 Введи название трека:")
     return WAIT_TRACK
 
-
-async def got_track(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    user_state[uid]["track"] = update.message.text.strip()
-    await update.message.reply_text(
-        "📝 Напиши *текст трека* (слова для 2-го слайда):\n\n"
-        "_Каждая строка будет на отдельной строке слайда_",
-        parse_mode="Markdown"
-    )
+async def got_track(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_state[update.effective_user.id]["track"] = update.message.text
+    await update.message.reply_text("📝 Введи текст песни (каждая строка — новый блок):")
     return WAIT_LYRICS
 
-
-async def got_lyrics(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def got_lyrics(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    user_state[uid]["lyrics"] = update.message.text.strip()
-    st  = user_state[uid]
-    msg = await update.message.reply_text("⏳ Генерирую...")
+    user_state[uid]["lyrics"] = update.message.text
+    
+    state = user_state[uid]
+    if state["mode"] == "single":
+        await _do_single(update, context, state)
+    else:
+        await _do_batch(update, context, state)
+    
+    return ConversationHandler.END
 
+# ── Генерация ───────────────────────────────────────────────────────────────
+async def _do_single(update: Update, context: ContextTypes.DEFAULT_TYPE, state: dict):
+    uid = update.effective_user.id
+    gen = CarouselGenerator(get_s(uid))
+    await update.message.reply_text("⏳ Генерирую слайды...")
+    
     try:
-        if st.get("mode") == "batch":
-            await _do_batch(update, ctx, uid, st)
-        else:
-            await _do_single(update, ctx, uid, st)
+        b1, b2, n1, n2 = gen.make_carousel(
+            state["data"], state["artist"], state["track"], state["lyrics"], "photo.png"
+        )
+        await update.message.reply_document(document=io.BytesIO(b1), filename=n1)
+        await update.message.reply_document(document=io.BytesIO(b2), filename=n2)
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка: {e}")
 
+async def _do_batch(update: Update, context: ContextTypes.DEFAULT_TYPE, state: dict):
+    uid = update.effective_user.id
+    gen = CarouselGenerator(get_s(uid))
+    await update.message.reply_text("⏳ Обрабатываю архив (это может занять время)...")
+    
+    output_zip_io = io.BytesIO()
+    count = 0
+    
     try:
-        await msg.delete()
-    except Exception:
-        pass
+        with zipfile.ZipFile(io.BytesIO(state["data"])) as in_zip:
+            with zipfile.ZipFile(output_zip_io, 'w') as out_zip:
+                for file_name in in_zip.namelist():
+                    if file_name.lower().endswith(('.png', '.jpg', '.jpeg')):
+                        photo_bytes = in_zip.read(file_name)
+                        # Генерация
+                        b1, b2, n1, n2 = gen.make_carousel(
+                            photo_bytes, state["artist"], state["track"], state["lyrics"], file_name
+                        )
+                        # Добавление в выходной архив
+                        out_zip.writestr(n1, b1)
+                        out_zip.writestr(n2, b2)
+                        count += 1
+        
+        output_zip_io.seek(0)
+        await update.message.reply_document(
+            document=output_zip_io,
+            filename="готовая_карусель.zip",
+            caption=f"✅ Готово! Обработано изображений: {count}"
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка при обработке архива: {e}")
 
-    user_state.pop(uid, None)
-    return ConversationHandler.END
+# ── Настройки (Callback) ────────────────────────────────────────────────────
+async def settings_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    uid = query.from_user.id
+    s = get_s(uid)
+    data = query.data
 
-
-async def _do_single(update, ctx, uid, st):
-    gen = CarouselGenerator(get_s(uid))
-    s1, s2, n1, n2 = gen.make_carousel(
-        photo_bytes=st["photo"],
-        artist=st["artist"],
-        track=st["track"],
-        lyrics=st["lyrics"],
-        original_filename=st.get("original_filename", "image.jpg"),
-    )
-    from telegram import InputMediaDocument
-    await ctx.bot.send_media_group(
-        chat_id=update.effective_chat.id,
-        media=[
-            InputMediaDocument(io.BytesIO(s1), filename=n1,
-                               caption=f"🎵 {st['artist']} — {st['track']}"),
-            InputMediaDocument(io.BytesIO(s2), filename=n2),
-        ]
-    )
-    await update.message.reply_text("✅ Готово! Загружай в TikTok 🔥")
-
-
-async def _do_batch(update, ctx, uid, st):
-    gen = CarouselGenerator(get_s(uid))
-    buf = io.BytesIO(st["zip_buf"])
-
-    with zipfile.ZipFile(buf) as zf:
-        images = [n for n in zf.namelist()
-                  if n.lower().endswith((".jpg",".jpeg",".png",".webp"))
-                  and not n.startswith("__MACOSX")
-                  and not Path(n).name.startswith(".")]
-
-    if not images:
-        await update.message.reply_text("❌ В архиве нет изображений")
+    if data == "set_color":
+        colors = ["white", "yellow", "cyan", "pink", "orange"]
+        idx = (colors.index(s["text_color"]) + 1) % len(colors)
+        s["text_color"] = colors[idx]
+    elif data == "set_blur":
+        blurs = [0, 10, 22, 40]
+        idx = (blurs.index(s["blur"]) + 1) % len(blurs)
+        s["blur"] = blurs[idx]
+    elif data in ["size_1", "size_2"]:
+        context.user_data["edit_size"] = data
+        await query.answer()
+        await query.message.reply_text("📏 Введи число для размера шрифта (например, 60):")
         return
 
-    await update.message.reply_text(f"🎨 {len(images)} фото — генерирую...")
+    await query.answer()
+    await cmd_settings(update, context)
 
-    out = io.BytesIO()
-    with zipfile.ZipFile(out, "w", zipfile.ZIP_STORED) as ozf:
-        buf.seek(0)
-        with zipfile.ZipFile(buf) as zf:
-            for i, name in enumerate(images, 1):
-                s1, s2, n1, n2 = gen.make_carousel(
-                    photo_bytes=zf.read(name),
-                    artist=st["artist"],
-                    track=st["track"],
-                    lyrics=st["lyrics"],
-                    original_filename=name,
-                )
-                ozf.writestr(n1, s1)
-                ozf.writestr(n2, s2)
-                if i % 5 == 0:
-                    await update.message.reply_text(f"⏳ {i}/{len(images)}...")
+async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Хендлер для ручного ввода размера шрифта
+    mode = context.user_data.get("edit_size")
+    if mode and update.message.text.isdigit():
+        val = int(update.message.text)
+        s = get_s(update.effective_user.id)
+        if mode == "size_1": s["font_size_slide1"] = val
+        else: s["font_size_slide2"] = val
+        context.user_data.pop("edit_size")
+        await update.message.reply_text("✅ Сохранено!")
+        await cmd_settings(update, context)
 
-    out.seek(0)
-    await ctx.bot.send_document(
-        chat_id=update.effective_chat.id,
-        document=out,
-        filename=f"carousels_{st['artist']}.zip",
-        caption=f"✅ {len(images)} каруселей готово! 🔥"
-    )
-
-
-async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    user_state.pop(uid, None)
-    ctx.user_data.pop("size_key", None)
-    await update.message.reply_text("❌ Отменено. Отправь фото чтобы начать заново.")
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("❌ Отменено.")
     return ConversationHandler.END
 
-
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ── Запуск ───────────────────────────────────────────────────────────────────
 def main():
-    token = os.environ["BOT_TOKEN"]
-    app   = Application.builder().token(token).build()
+    token = os.environ.get("BOT_TOKEN")
+    if not token:
+        print("❌ Ошибка: BOT_TOKEN не найден в переменных окружения!")
+        return
+
+    app = Application.builder().token(token).build()
 
     conv = ConversationHandler(
         entry_points=[
             MessageHandler(filters.PHOTO, photo_received),
-            MessageHandler(filters.Document.ALL, document_received),
+            MessageHandler(filters.Document.ZIP | filters.Document.FileExtension("zip"), document_received),
         ],
         states={
             WAIT_ARTIST: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_artist)],
@@ -350,21 +204,16 @@ def main():
             WAIT_LYRICS: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_lyrics)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
-        allow_reentry=True,
     )
 
-    app.add_handler(CommandHandler("start",    cmd_start))
-    app.add_handler(CommandHandler("help",     cmd_start))
+    app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("settings", cmd_settings))
-    app.add_handler(CommandHandler("cancel",   cancel))
     app.add_handler(CallbackQueryHandler(settings_cb))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
     app.add_handler(conv)
-    # Текст вне диалога — только для ввода размера шрифта
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_outside_conv))
 
-    print("🤖 Bot v6 started!")
-    app.run_polling(drop_pending_updates=True)
-
+    print("🤖 Бот запущен...")
+    app.run_polling()
 
 if __name__ == "__main__":
     main()
