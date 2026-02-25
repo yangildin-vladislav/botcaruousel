@@ -1,6 +1,17 @@
 import io
+import textwrap
 from pathlib import Path
-from PIL import Image, ImageOps, ImageDraw, ImageFont, ImageFilter
+from PIL import Image, ImageFilter, ImageDraw, ImageFont
+
+# Константы для оригинальной карусели
+CANVAS_W = 2160
+CANVAS_H = 1080
+SLIDE_W  = 1080
+PHOTO_SZ = 864
+PHOTO_X  = SLIDE_W - PHOTO_SZ // 2
+PHOTO_Y  = (CANVAS_H - PHOTO_SZ) // 2
+ARTIST_CX    = PHOTO_X // 2
+FREE_ZONE_CX = 1836
 
 class CarouselGenerator:
     def __init__(self, settings):
@@ -17,7 +28,7 @@ class CarouselGenerator:
             return ImageFont.load_default()
 
     def center_crop_square(self, img):
-        """Обрезает изображение до квадрата 1:1 по центру"""
+        """Обрезает любое фото до квадрата 1:1"""
         width, height = img.size
         new_size = min(width, height)
         left = (width - new_size) / 2
@@ -26,68 +37,85 @@ class CarouselGenerator:
         bottom = (height + new_size) / 2
         return img.crop((left, top, right, bottom))
 
+    def shadow_centered(self, draw, text, font, color, cx, y):
+        """Рисование текста с тенью по центру (для Карусели)"""
+        bbox = draw.textbbox((0, 0), text, font=font)
+        tw = bbox[2] - bbox[0]
+        tx = cx - tw // 2
+        draw.text((tx+2, y+2), text, font=font, fill=(0, 0, 0, 120))
+        draw.text((tx, y), text, font=font, fill=color)
+
     def draw_impact_text(self, draw, text, font, size_px):
-        """Рисует текст в стиле Impact с обводкой"""
+        """Рисование текста с обводкой (для Impact)"""
         w, h = size_px
         lines = text.split('\n')
-        
-        # Считаем общую высоту блока текста
-        total_text_h = 0
-        line_data = []
+        total_h = sum(draw.textbbox((0,0), l, font=font)[3] for l in lines) + (len(lines)*15)
+        curr_y = (h - total_h) // 2
         for line in lines:
-            bbox = draw.textbbox((0, 0), line, font=font)
-            line_w, line_h = bbox[2] - bbox[0], bbox[3] - bbox[1]
-            line_data.append((line, line_w, line_h))
-            total_text_h += line_h + 15
-
-        current_y = (h - total_text_h) // 2
-        for line, lw, lh in line_data:
-            x = (w - lw) // 2
-            # Жирная черная обводка
-            for off in [(-3,-3),(3,-3),(-3,3),(3,3),(0,-3),(0,3),(-3,0),(3,0)]:
-                draw.text((x+off[0], current_y+off[1]), line, font=font, fill="black")
-            draw.text((x, current_y), line, font=font, fill="white")
-            current_y += lh + 15
+            bbox = draw.textbbox((0,0), line, font=font)
+            line_w = bbox[2] - bbox[0]
+            line_h = bbox[3] - bbox[1]
+            x = (w - line_w) // 2
+            for o in [(-3,-3),(3,-3),(-3,3),(3,3),(0,-3),(0,3),(-3,0),(2,0)]:
+                draw.text((x+o[0], curr_y+o[1]), line, font=font, fill="black")
+            draw.text((x, curr_y), line, font=font, fill="white")
+            curr_y += line_h + 15
 
     def make_carousel(self, image_bytes, artist, track, lyrics, original_name, mode="carousel"):
-        img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        
-        # КВАДРАТНАЯ ОБРЕЗКА 1:1
-        img = self.center_crop_square(img)
-        # Увеличиваем до стандартного хорошего разрешения, например 1080x1080
-        img = img.resize((1080, 1080), Image.Resampling.LANCZOS)
-        width, height = img.size
+        raw_img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        # Всегда сначала делаем квадрат
+        square_img = self.center_crop_square(raw_img)
 
         if mode == "impact":
-            # --- РЕЖИМ МЕМ (IMPACT) ---
-            f_main = self.get_font("impact", self.settings.get("font_size_slide1", 80))
+            # --- РЕЖИМ IMPACT (МЕМ) ---
+            img = square_img.resize((1080, 1080), Image.Resampling.LANCZOS)
+            f_main = self.get_font("impact", self.settings.get("font_size_slide1", 85))
             f_lyr = self.get_font("impact", self.settings.get("font_size_slide2", 50))
             
-            # Слайд 1 (Только Артист)
-            s1 = img.copy()
-            self.draw_impact_text(ImageDraw.Draw(s1), artist.upper(), f_main, (width, height))
-            
-            # Слайд 2 (Текст)
-            s2 = img.copy()
-            self.draw_impact_text(ImageDraw.Draw(s2), lyrics.upper(), f_lyr, (width, height))
+            s1 = img.copy(); self.draw_impact_text(ImageDraw.Draw(s1), artist.upper(), f_main, (1080,1080))
+            s2 = img.copy(); self.draw_impact_text(ImageDraw.Draw(s2), lyrics.upper(), f_lyr, (1080,1080))
         else:
-            # --- РЕЖИМ КАРУСЕЛЬ ---
-            # (Тут можно оставить логику из предыдущего шага, 
-            # но так как вы просили 1:1, просто наложим текст поверх квадрата)
-            f_main = self.get_font("normal", self.settings.get("font_size_slide1", 70))
-            f_lyr = self.get_font("normal", self.settings.get("font_size_slide2", 40))
+            # --- ВАШ ОСНОВНОЙ РЕЖИМ КАРУСЕЛИ ---
+            canvas = Image.new("RGB", (CANVAS_W, CANVAS_H), (30, 30, 30))
+            # Размытый фон
+            blur_bg = square_img.resize((CANVAS_W, CANVAS_H), Image.Resampling.LANCZOS)
+            blur_bg = blur_bg.filter(ImageFilter.GaussianBlur(self.settings.get("blur", 22)))
+            canvas.paste(blur_bg, (0, 0))
+
+            # Скругленное фото по центру
+            mask = Image.new("L", (PHOTO_SZ, PHOTO_SZ), 0)
+            draw_m = ImageDraw.Draw(mask)
+            draw_m.rounded_rectangle((0, 0, PHOTO_SZ, PHOTO_SZ), 50, fill=255)
+            photo = square_img.resize((PHOTO_SZ, PHOTO_SZ), Image.Resampling.LANCZOS).convert("RGBA")
+            photo.putalpha(mask)
+            canvas.paste(photo, (PHOTO_X, PHOTO_Y), photo)
+
+            final_cv = canvas.convert("RGB")
+            draw = ImageDraw.Draw(final_cv)
+            color = self.settings.get("text_color", "white")
             
-            s1 = img.copy()
-            draw1 = ImageDraw.Draw(s1)
-            # Тень и текст для карусели
-            txt1 = f"{artist}\n{track}"
-            self.draw_impact_text(draw1, txt1, f_main, (width, height)) # Используем ту же функцию обводки для читаемости
-            
-            s2 = img.copy()
-            self.draw_impact_text(ImageDraw.Draw(s2), lyrics, f_lyr, (width, height))
+            # Текст Слайд 1 (Артист и Трек слева)
+            sz1 = self.settings.get("font_size_slide1", 78)
+            fnt_a = self.get_font("normal", sz1)
+            fnt_t = self.get_font("normal", max(14, sz1 - 20))
+            y1 = (CANVAS_H - (sz1 * 2 + 20)) // 2
+            self.shadow_centered(draw, artist, fnt_a, color, ARTIST_CX, y1)
+            self.shadow_centered(draw, track, fnt_t, color, ARTIST_CX, y1 + sz1 + 20)
+
+            # Текст Слайд 2 (Лирика справа)
+            sz2 = self.settings.get("font_size_slide2", 44)
+            fnt_l = self.get_font("normal", sz2)
+            lines = []
+            for line in lyrics.split('\n'): lines.extend(textwrap.wrap(line, width=22))
+            y2 = (CANVAS_H - (len(lines)*(sz2+15))) // 2
+            for line in lines:
+                self.shadow_centered(draw, line, fnt_l, color, FREE_ZONE_CX, y2)
+                y2 += sz2 + 15
+
+            s1 = final_cv.crop((0, 0, SLIDE_W, CANVAS_H))
+            s2 = final_cv.crop((SLIDE_W, 0, CANVAS_W, CANVAS_H))
 
         out1, out2 = io.BytesIO(), io.BytesIO()
         s1.save(out1, format="JPEG", quality=90)
         s2.save(out2, format="JPEG", quality=90)
-        base = original_name.rsplit('.', 1)[0]
-        return out1.getvalue(), out2.getvalue(), f"{base}_1.jpg", f"{base}_2.jpg"
+        return out1.getvalue(), out2.getvalue(), f"{original_name}_1.jpg", f"{original_name}_2.jpg"
