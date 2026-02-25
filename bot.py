@@ -3,20 +3,27 @@ import io
 import zipfile
 import logging
 import threading
+import asyncio
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from telegram import Update
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     filters, ContextTypes, ConversationHandler
 )
+# Убедитесь, что в generator.py функция называется make_carousel
 from generator import CarouselGenerator
 
-# --- НАСТРОЙКИ ---
-logging.basicConfig(level=logging.INFO)
+# --- КОНФИГУРАЦИЯ ---
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-MAX_ZIP_SIZE = 19 * 1024 * 1024  # Лимит 19 МБ для обхода ограничений
+# Лимит 19 МБ, так как Render/Telegram могут обрывать соединение на 20 МБ
+MAX_ZIP_SIZE = 19 * 1024 * 1024 
+
 WAIT_ARTIST, WAIT_TRACK, WAIT_LYRICS = range(3)
 
 user_state = {}
@@ -34,13 +41,20 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b"Bot is running")
 
+    def do_HEAD(self):
+        self.send_response(200)
+        self.end_headers()
+
+    def log_message(self, format, *args):
+        return # Отключаем лишние логи сервера в консоль
+
 def run_health_check_server():
     port = int(os.environ.get("PORT", 8080))
     server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
-    logger.info(f"Health check server started on port {port}")
+    logger.info(f"✅ Health check server started on port {port}")
     server.serve_forever()
 
-# --- ЛОГИКА БОТА ---
+# --- ЛОГИКА ОБРАБОТКИ ---
 async def start_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if update.message.photo:
@@ -49,7 +63,8 @@ async def start_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         doc = update.message.document
         file_id, name = doc.file_id, doc.file_name
         mode = "batch" if name.lower().endswith('.zip') else "single"
-    else: return ConversationHandler.END
+    else:
+        return ConversationHandler.END
 
     user_state[uid] = {"file_id": file_id, "mode": mode, "name": name}
     await update.message.reply_text("👤 Введите имя артиста:")
@@ -70,7 +85,8 @@ async def got_lyrics(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = user_state.get(uid)
     if not state: return ConversationHandler.END
     state["lyrics"] = update.message.text
-    await update.message.reply_text("⏳ Обработка началась. Архивы будут приходить по ~20МБ...")
+    
+    await update.message.reply_text("⏳ Начинаю обработку. При больших пачках архивы придут частями...")
 
     try:
         file = await context.bot.get_file(state["file_id"])
@@ -84,6 +100,7 @@ async def got_lyrics(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             with zipfile.ZipFile(io.BytesIO(f_bytes)) as in_zip:
                 files = [f for f in in_zip.namelist() if f.lower().endswith(('.png', '.jpg', '.jpeg')) and not f.startswith('__')]
+                
                 output_zip_io = io.BytesIO()
                 current_zip = zipfile.ZipFile(output_zip_io, 'w')
                 part_num = 1
@@ -91,13 +108,15 @@ async def got_lyrics(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 for f_name in files:
                     img_data = in_zip.read(f_name)
                     b1, b2, n1, n2 = gen.make_carousel(img_data, state["artist"], state["track"], state["lyrics"], f_name)
+                    
                     current_zip.writestr(n1, b1)
                     current_zip.writestr(n2, b2)
 
+                    # Если размер архива в памяти превысил лимит
                     if output_zip_io.tell() > MAX_ZIP_SIZE:
                         current_zip.close()
                         output_zip_io.seek(0)
-                        await update.message.reply_document(output_zip_io, filename=f"part_{part_num}.zip")
+                        await update.message.reply_document(output_zip_io, filename=f"part_{part_num}.zip", caption=f"📦 Часть {part_num}")
                         output_zip_io = io.BytesIO()
                         current_zip = zipfile.ZipFile(output_zip_io, 'w')
                         part_num += 1
@@ -105,28 +124,47 @@ async def got_lyrics(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 current_zip.close()
                 if output_zip_io.tell() > 100:
                     output_zip_io.seek(0)
-                    await update.message.reply_document(output_zip_io, filename=f"part_{part_num}.zip")
-        await update.message.reply_text("✨ Готово!")
+                    await update.message.reply_document(output_zip_io, filename=f"part_{part_num}.zip", caption="✅ Финальная часть")
+        
+        await update.message.reply_text("✨ Обработка завершена!")
     except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка: {e}")
+        logger.error(f"Ошибка: {e}")
+        await update.message.reply_text(f"❌ Произошла ошибка: {e}")
+    
     user_state.pop(uid, None)
     return ConversationHandler.END
 
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_state.pop(update.effective_user.id, None)
+    await update.message.reply_text("❌ Отменено.")
+    return ConversationHandler.END
+
+# --- ЗАПУСК ---
 def main():
-    # Запуск сервера для Render в отдельном потоке
+    # 1. Запуск Health Check сервера для Render
     threading.Thread(target=run_health_check_server, daemon=True).start()
 
+    if not BOT_TOKEN:
+        logger.error("❌ Переменная BOT_TOKEN не установлена!")
+        return
+
+    # 2. Инициализация бота
     app = Application.builder().token(BOT_TOKEN).build()
-    conv = ConversationHandler(
+
+    conv_handler = ConversationHandler(
         entry_points=[MessageHandler(filters.PHOTO | filters.Document.ALL, start_file)],
         states={
             WAIT_ARTIST: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_artist)],
             WAIT_TRACK:  [MessageHandler(filters.TEXT & ~filters.COMMAND, got_track)],
             WAIT_LYRICS: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_lyrics)],
         },
-        fallbacks=[CommandHandler("cancel", lambda u, c: ConversationHandler.END)]
+        fallbacks=[CommandHandler("cancel", cancel)],
     )
-    app.add_handler(conv)
+
+    app.add_handler(CommandHandler("start", lambda u, c: u.message.reply_text("📸 Пришли фото или ZIP-архив")))
+    app.add_handler(conv_handler)
+
+    logger.info("🚀 Бот запущен...")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
