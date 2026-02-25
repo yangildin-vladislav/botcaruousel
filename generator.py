@@ -1,191 +1,310 @@
 """
-CarouselGenerator — делает 2 слайда для TikTok карусели.
-Слайд 1: размытый фон + имя артиста + название трека
-Слайд 2: размытый фон (продолжение) + текст трека
-Вместе они образуют цельную картину при листании.
+CarouselGenerator v3
+════════════════════
+Холст: 2160×1080 (2 слайда по 1080×1080)
+
+Логика фото:
+  - Фото обрезается в квадрат 1:1 (crop по центру)
+  - Холст делится на 5 равных колонок по 432px каждая
+  - Квадратная фотка занимает колонки 1–4 на слайде 1 (x: 0..1728)
+    т.е. начинается с x=0 и заканчивается на x=1728 (переходит на слайд 2 на 648px)
+  - При листании фото "перетекает": на слайде 2 видна правая часть (колонки 4–5, x: 1296..1728 относительно слайда 2)
+  
+Координаты:
+  Колонка 1: 0–432
+  Колонка 2: 432–864
+  Колонка 3: 864–1296
+  Колонка 4: 1296–1728
+  Колонка 5: 1728–2160
+
+  Фото (1728×1080 растянутое из квадрата) вставляется от x=0 до x=1728
+  → На слайде 1 (0..1080): видна левая часть фото (0..1080px из 1728px)
+  → На слайде 2 (1080..2160): видна правая часть фото (648..1728px), т.е. 2/5
+
+Слайд 1: фоновое размытое фото + неразмытая фотка (4/5 ширины) + артист + трек
+Слайд 2: фоновое размытое фото + продолжение фотки (2/5 ширины) + текст трека
+
+Текст:
+  - justify выравнивание
+  - авто-уменьшение если не влезает
+  - гарантированный перенос строк
 """
 
 import io
 from PIL import Image, ImageFilter, ImageDraw, ImageFont, ImageEnhance
 import textwrap
-import urllib.request
-import os
-import math
 
-# ── Размеры TikTok (9:16) ────────────────────────────────────────────────────
-SLIDE_W = 1080
-SLIDE_H = 1920
-CANVAS_W = SLIDE_W * 2  # общий холст = 2 слайда рядом
+# ── Размеры ──────────────────────────────────────────────────────────────────
+SLIDE_W  = 1080
+SLIDE_H  = 1080
+CANVAS_W = 2160   # 2 слайда
+CANVAS_H = 1080
 
-# ── Цвета ────────────────────────────────────────────────────────────────────
+COL = CANVAS_W // 5   # 432px — одна колонка
+# Фото занимает колонки 0–3 = 4 колонки = 1728px
+PHOTO_START_X = 0
+PHOTO_END_X   = COL * 4   # 1728
+
+PADDING = 60
+
+FONT_PATHS = {
+    "bold":   "/usr/share/fonts/truetype/google-fonts/Poppins-Bold.ttf",
+    "medium": "/usr/share/fonts/truetype/google-fonts/Poppins-Medium.ttf",
+    "light":  "/usr/share/fonts/truetype/google-fonts/Poppins-Light.ttf",
+    "italic": "/usr/share/fonts/truetype/google-fonts/Poppins-BoldItalic.ttf",
+}
+FALLBACK_FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+
 TEXT_COLORS = {
     "white":  (255, 255, 255),
-    "yellow": (255, 230, 80),
-    "cyan":   (80, 230, 255),
-    "pink":   (255, 100, 200),
-    "orange": (255, 160, 50),
+    "yellow": (255, 225, 60),
+    "cyan":   (60, 220, 255),
+    "pink":   (255, 80, 190),
+    "orange": (255, 150, 40),
+    "red":    (255, 60, 60),
+    "green":  (60, 220, 120),
 }
 
-# ── Шрифты (Google Fonts CDN — скачиваем при первом запуске) ────────────────
-FONTS_DIR = os.path.join(os.path.dirname(__file__), "fonts")
-os.makedirs(FONTS_DIR, exist_ok=True)
 
-FONT_URLS = {
-    "bold":   "https://github.com/google/fonts/raw/main/ofl/montserrat/static/Montserrat-Bold.ttf",
-    "light":  "https://github.com/google/fonts/raw/main/ofl/montserrat/static/Montserrat-Light.ttf",
-    "italic": "https://github.com/google/fonts/raw/main/ofl/montserrat/static/Montserrat-BoldItalic.ttf",
-}
-
-def download_font(style: str) -> str:
-    path = os.path.join(FONTS_DIR, f"font_{style}.ttf")
-    if not os.path.exists(path):
-        print(f"Downloading font: {style}...")
-        urllib.request.urlretrieve(FONT_URLS[style], path)
-    return path
-
-
-def load_font(style: str, size: int) -> ImageFont.FreeTypeFont:
+# ── Утилиты шрифтов ───────────────────────────────────────────────────────────
+def get_font(style: str, size: int) -> ImageFont.FreeTypeFont:
+    path = FONT_PATHS.get(style, FONT_PATHS["bold"])
     try:
-        path = download_font(style)
         return ImageFont.truetype(path, size)
     except Exception:
-        return ImageFont.load_default()
+        try:
+            return ImageFont.truetype(FALLBACK_FONT, size)
+        except Exception:
+            return ImageFont.load_default()
 
 
-# ── Generator ────────────────────────────────────────────────────────────────
+# ── Фон ──────────────────────────────────────────────────────────────────────
+def make_bg(photo: Image.Image, blur: int) -> Image.Image:
+    """Размытый фон на весь холст 2160×1080."""
+    bg = photo.resize((CANVAS_W, CANVAS_H), Image.LANCZOS)
+    if blur > 0:
+        bg = bg.filter(ImageFilter.GaussianBlur(radius=blur))
+    bg = ImageEnhance.Brightness(bg).enhance(0.35)
+    return bg.convert("RGB")
+
+
+def crop_square(photo: Image.Image) -> Image.Image:
+    """Обрезает фото по центру в квадрат 1:1."""
+    w, h = photo.size
+    side = min(w, h)
+    left = (w - side) // 2
+    top  = (h - side) // 2
+    return photo.crop((left, top, left + side, top + side))
+
+
+# ── Текст с тенью ─────────────────────────────────────────────────────────────
+def draw_shadow_text(draw, xy, text, font, color, shadow=3):
+    x, y = xy
+    draw.text((x + shadow, y + shadow), text, font=font, fill=(0, 0, 0))
+    draw.text((x, y), text, font=font, fill=color)
+
+
+def draw_centered_text(draw, text, font, color, slide_offset_x, y, slide_width=SLIDE_W):
+    """Рисует текст по центру слайда."""
+    bbox = draw.textbbox((0, 0), text, font=font)
+    w = bbox[2] - bbox[0]
+    x = slide_offset_x + (slide_width - w) // 2
+    draw_shadow_text(draw, (x, y), text, font, color)
+
+
+# ── Justify текст ─────────────────────────────────────────────────────────────
+def draw_justify_line(draw, line, font, x_start, y, max_w, color, is_last=False):
+    words = line.split()
+    if not words:
+        return
+    if is_last or len(words) == 1:
+        draw_shadow_text(draw, (x_start, y), line, font, color)
+        return
+    total_word_w = sum(draw.textlength(w, font=font) for w in words)
+    gap_total = max_w - total_word_w
+    gap = gap_total / (len(words) - 1)
+    cx = float(x_start)
+    for i, word in enumerate(words):
+        draw_shadow_text(draw, (int(cx), y), word, font, color)
+        cx += draw.textlength(word, font=font) + gap
+
+
+def render_lyrics(draw, lyrics, font_style, font_size, max_w, max_h, color, x0, y0):
+    """
+    Рендерит текст трека с justify и авто-уменьшением размера.
+    Гарантирует что весь текст влезает в max_h.
+    """
+    raw_lines = [l.rstrip() for l in lyrics.split("\n")]
+
+    for size in range(font_size, 13, -2):
+        font = get_font(font_style, size)
+        line_h = int(size * 1.55)
+
+        # Wrap каждую строку
+        wrapped = []
+        for raw in raw_lines:
+            if not raw.strip():
+                wrapped.append("")
+                continue
+            # Подбираем ширину обёртки по пикселям
+            chars = max(4, int(max_w / (size * 0.54)))
+            parts = textwrap.wrap(raw, width=chars) or [""]
+            # Проверяем каждую часть на ширину
+            for part in parts:
+                # Если часть шире — уменьшаем chars
+                attempts = 0
+                while draw.textlength(part, font=font) > max_w and attempts < 20:
+                    chars = max(3, chars - 1)
+                    parts = textwrap.wrap(raw, width=chars) or [""]
+                    attempts += 1
+                wrapped.extend(parts)
+                break
+
+        total_h = len(wrapped) * line_h
+        if total_h <= max_h:
+            # Рендерим
+            y = y0
+            for i, line in enumerate(wrapped):
+                if not line:
+                    y += line_h
+                    continue
+                is_last = (i == len(wrapped) - 1)
+                draw_justify_line(draw, line, font, x0, y, max_w, color, is_last)
+                y += line_h
+            return size
+
+    # Крайний случай — рисуем минимальным
+    font = get_font(font_style, 14)
+    y = y0
+    for raw in raw_lines:
+        draw_shadow_text(draw, (x0, y), raw[:90], font, color)
+        y += 22
+    return 14
+
+
+# ── Основной класс ────────────────────────────────────────────────────────────
 class CarouselGenerator:
     def __init__(self, settings: dict):
-        self.settings = settings
+        self.s = settings
 
-    def make_carousel(
-        self,
-        photo_bytes: bytes,
-        artist: str,
-        track: str,
-        lyrics: str,
-    ) -> tuple[bytes, bytes]:
-        """Returns (slide1_bytes, slide2_bytes) as JPEG."""
+    def make_carousel(self, photo_bytes: bytes, artist: str, track: str, lyrics: str,
+                      original_filename: str = "image") -> tuple[bytes, bytes, str, str]:
+        """
+        Возвращает (slide1_png, slide2_png, name1, name2).
+        name1 = "filename_левая_часть.png"
+        name2 = "filename_правая_часть.png"
+        """
+        s = self.s
+        blur      = s.get("blur", 18)
+        color     = TEXT_COLORS.get(s.get("text_color", "white"), (255, 255, 255))
+        font_st   = s.get("font", "bold")
+        size1     = int(s.get("font_size_slide1", 80))
+        size2     = int(s.get("font_size_slide2", 48))
+        use_grad  = s.get("gradient", True)
 
-        s = self.settings
-        blur_radius = s.get("blur", 18)
-        text_color = TEXT_COLORS.get(s.get("text_color", "white"), (255, 255, 255))
-        font_style = s.get("font", "bold")
-        font_size = s.get("font_size", 52)
-        use_gradient = s.get("gradient", True)
+        # Имена файлов
+        stem = Path_stem(original_filename)
+        name1 = f"{stem}_левая_часть.png"
+        name2 = f"{stem}_правая_часть.png"
 
-        # 1. Загружаем и растягиваем фото на ДВОЙНОЙ холст
-        img = Image.open(io.BytesIO(photo_bytes)).convert("RGB")
-        canvas = img.resize((CANVAS_W, SLIDE_H), Image.LANCZOS)
+        photo = Image.open(io.BytesIO(photo_bytes)).convert("RGB")
 
-        # 2. Размытие
-        bg = canvas.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+        # 1. Размытый фон 2160×1080
+        canvas = make_bg(photo, blur)
 
-        # 3. Затемнение
-        bg = ImageEnhance.Brightness(bg).enhance(0.45)
+        # 2. Градиент поверх фона
+        if use_grad:
+            grad = Image.new("RGBA", (CANVAS_W, CANVAS_H), (0, 0, 0, 0))
+            gd = ImageDraw.Draw(grad)
+            for y in range(CANVAS_H):
+                a = int(160 * (y / CANVAS_H) ** 1.3)
+                gd.line([(0, y), (CANVAS_W, y)], fill=(0, 0, 0, a))
+            canvas = Image.alpha_composite(canvas.convert("RGBA"), grad).convert("RGB")
 
-        # 4. Градиентный оверлей (опционально)
-        if use_gradient:
-            grad = Image.new("RGBA", (CANVAS_W, SLIDE_H), (0, 0, 0, 0))
-            draw_g = ImageDraw.Draw(grad)
-            for y in range(SLIDE_H):
-                alpha = int(180 * (y / SLIDE_H) ** 1.5)
-                draw_g.line([(0, y), (CANVAS_W, y)], fill=(0, 0, 0, alpha))
-            bg = bg.convert("RGBA")
-            bg = Image.alpha_composite(bg, grad).convert("RGB")
+        # 3. Квадратная обрезка фото, масштаб до 1728×1080 (4 колонки × CANVAS_H)
+        sq = crop_square(photo)
+        photo_w = PHOTO_END_X  # 1728
+        photo_h = CANVAS_H     # 1080
+        sq_resized = sq.resize((photo_w, photo_h), Image.LANCZOS)
 
-        draw = ImageDraw.Draw(bg)
+        # Вставляем фото начиная с x=0 на весь холст (перекрывает обе слайды частично)
+        canvas.paste(sq_resized, (PHOTO_START_X, 0))
 
-        # ── СЛАЙД 1: Артист + Трек ──────────────────────────────────────────
-        font_artist = load_font(font_style, font_size + 10)
-        font_track  = load_font(font_style, font_size)
-        font_hint   = load_font("light", 32)
+        # 4. Тёмные полосы поверх фото для текстовых зон
+        draw = ImageDraw.Draw(canvas)
 
-        # Маленький разделитель
-        line_y = SLIDE_H // 2 - 20
+        # ── СЛАЙД 1: Артист + Трек ────────────────────────────────────────────
+        # Текстовая зона — нижняя часть слайда 1 (не на фото-зоне, а левее)
+        # Фото занимает x: 0..1728, слайд 1 это x: 0..1080
+        # Значит на слайде 1 фото полностью перекрывает слайд (0..1080 < 1728)
+        # Рисуем тёмный блок под текст в нижней части слайда 1
 
-        # Имя артиста
-        a_bbox = draw.textbbox((0, 0), artist.upper(), font=font_artist)
-        a_w = a_bbox[2] - a_bbox[0]
-        a_x = (SLIDE_W - a_w) // 2
-        a_y = line_y - 140
+        text1_h = 220
+        ov1 = Image.new("RGBA", (SLIDE_W, text1_h), (0, 0, 0, 160))
+        canvas_rgba = canvas.convert("RGBA")
+        canvas_rgba.paste(ov1, (0, SLIDE_H - text1_h), ov1)
+        canvas = canvas_rgba.convert("RGB")
+        draw = ImageDraw.Draw(canvas)
 
-        # Тень
-        draw.text((a_x + 3, a_y + 3), artist.upper(), font=font_artist, fill=(0, 0, 0, 180))
-        draw.text((a_x, a_y), artist.upper(), font=font_artist, fill=text_color)
+        font_artist = get_font(font_st, size1)
+        font_track  = get_font(font_st, max(14, size1 - 22))
 
-        # Линия-разделитель
-        line_color = (*text_color[:3], 120)
-        line_margin = 80
-        draw.rectangle(
-            [line_margin, line_y + 10, SLIDE_W - line_margin, line_y + 14],
-            fill=(*text_color[:3],)
+        # Артист по центру слайда 1
+        ab = draw.textbbox((0, 0), artist, font=font_artist)
+        a_h = ab[3] - ab[1]
+        center_y = SLIDE_H - text1_h + (text1_h // 2) - a_h - 10
+        draw_centered_text(draw, artist, font_artist, color, 0, center_y)
+
+        # Трек ниже
+        tb = draw.textbbox((0, 0), track, font=font_track)
+        t_y = center_y + a_h + 12
+        draw_centered_text(draw, track, font_track, color, 0, t_y)
+
+        # ── СЛАЙД 2: Текст трека ──────────────────────────────────────────────
+        # На слайде 2 (x: 1080..2160) фото видно от x=1080 до x=1728 → это 648px = 1.5 колонки
+        # Текст располагается в правой части слайда 2, где нет фото (x: 1728..2160 = 432px)
+        # + немного заходим на фото с тёмным overlay
+
+        # Тёмный overlay на правые 2 колонки слайда 2 (x: 1728..2160 = вся 5-я колонка + часть 4-й)
+        text2_x_start = SLIDE_W + COL  # 1080+432 = 1512 (от 2-й колонки слайда 2)
+        text2_w = CANVAS_W - text2_x_start  # 2160-1512 = 648
+
+        ov2 = Image.new("RGBA", (text2_w, CANVAS_H), (0, 0, 0, 190))
+        canvas_rgba = canvas.convert("RGBA")
+        canvas_rgba.paste(ov2, (text2_x_start, 0), ov2)
+        canvas = canvas_rgba.convert("RGB")
+        draw = ImageDraw.Draw(canvas)
+
+        # Рендерим текст трека
+        txt_pad = 40
+        render_lyrics(
+            draw=draw,
+            lyrics=lyrics,
+            font_style=font_st,
+            font_size=size2,
+            max_w=text2_w - txt_pad * 2,
+            max_h=CANVAS_H - txt_pad * 2,
+            color=color,
+            x0=text2_x_start + txt_pad,
+            y0=txt_pad,
         )
 
-        # Название трека
-        t_bbox = draw.textbbox((0, 0), track, font=font_track)
-        t_w = t_bbox[2] - t_bbox[0]
-        t_x = (SLIDE_W - t_w) // 2
-        t_y = line_y + 30
+        # 5. Тонкая линия стыка слайдов
+        draw.rectangle([SLIDE_W - 1, 0, SLIDE_W + 1, SLIDE_H], fill=(255, 255, 255, 25))
 
-        draw.text((t_x + 2, t_y + 2), track, font=font_track, fill=(0, 0, 0, 180))
-        draw.text((t_x, t_y), track, font=font_track, fill=text_color)
+        # 6. Нарезаем
+        slide1 = canvas.crop((0, 0, SLIDE_W, SLIDE_H))
+        slide2 = canvas.crop((SLIDE_W, 0, CANVAS_W, SLIDE_H))
 
-        # Подсказка "листай →"
-        hint = "листай →"
-        h_bbox = draw.textbbox((0, 0), hint, font=font_hint)
-        h_w = h_bbox[2] - h_bbox[0]
-        draw.text(
-            ((SLIDE_W - h_w) // 2, SLIDE_H - 120),
-            hint, font=font_hint,
-            fill=(*text_color[:3], 160)
-        )
-
-        # ── СЛАЙД 2: Текст трека ──────────────────────────────────────────
-        font_lyrics = load_font(font_style, font_size - 4)
-        font_title2 = load_font("light", 34)
-
-        # Заголовок на слайде 2
-        title2 = f"{artist} — {track}"
-        t2_bbox = draw.textbbox((0, 0), title2, font=font_title2)
-        t2_w = t2_bbox[2] - t2_bbox[0]
-        draw.text(
-            (SLIDE_W + (SLIDE_W - t2_w) // 2, 100),
-            title2, font=font_title2,
-            fill=(*text_color[:3], 180)
-        )
-
-        # Текст трека — wrapping
-        max_chars = max(10, int(SLIDE_W * 0.85 / (font_size * 0.55)))
-        lines = []
-        for raw_line in lyrics.split("\n"):
-            wrapped = textwrap.wrap(raw_line.strip(), width=max_chars) if raw_line.strip() else [""]
-            lines.extend(wrapped)
-
-        line_height = font_size + 18
-        total_text_h = len(lines) * line_height
-        start_y = max(180, (SLIDE_H - total_text_h) // 2)
-
-        for i, line in enumerate(lines):
-            l_bbox = draw.textbbox((0, 0), line, font=font_lyrics)
-            l_w = l_bbox[2] - l_bbox[0]
-            lx = SLIDE_W + (SLIDE_W - l_w) // 2
-            ly = start_y + i * line_height
-            # Тень
-            draw.text((lx + 2, ly + 2), line, font=font_lyrics, fill=(0, 0, 0, 200))
-            draw.text((lx, ly), line, font=font_lyrics, fill=text_color)
-
-        # ── Вертикальная линия-стык ──────────────────────────────────────
-        # (тонкий акцент посередине — на обоих слайдах по краю)
-        stitch_color = (*text_color[:3], 60)
-        draw.rectangle([SLIDE_W - 2, 0, SLIDE_W + 2, SLIDE_H], fill=stitch_color)
-
-        # ── Crop в 2 слайда ──────────────────────────────────────────────
-        slide1_img = bg.crop((0, 0, SLIDE_W, SLIDE_H))
-        slide2_img = bg.crop((SLIDE_W, 0, CANVAS_W, SLIDE_H))
-
-        def to_bytes(im: Image.Image) -> bytes:
+        def to_png(im: Image.Image) -> bytes:
             buf = io.BytesIO()
-            im.save(buf, format="JPEG", quality=95)
+            im.save(buf, format="PNG", compress_level=0)
             return buf.getvalue()
 
-        return to_bytes(slide1_img), to_bytes(slide2_img)
+        return to_png(slide1), to_png(slide2), name1, name2
+
+
+def Path_stem(filename: str) -> str:
+    """Возвращает имя файла без расширения."""
+    from pathlib import Path
+    return Path(filename).stem
