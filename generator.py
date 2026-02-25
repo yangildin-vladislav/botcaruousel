@@ -1,121 +1,139 @@
-import io
-import textwrap
-from pathlib import Path
-from PIL import Image, ImageFilter, ImageDraw, ImageFont
+import os, io, zipfile, logging, threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, 
+    filters, ContextTypes, ConversationHandler, CallbackQueryHandler
+)
+from generator import CarouselGenerator
 
-# Константы для оригинальной карусели
-CANVAS_W = 2160
-CANVAS_H = 1080
-SLIDE_W  = 1080
-PHOTO_SZ = 864
-PHOTO_X  = SLIDE_W - PHOTO_SZ // 2
-PHOTO_Y  = (CANVAS_H - PHOTO_SZ) // 2
-ARTIST_CX    = PHOTO_X // 2
-FREE_ZONE_CX = 1836
+logging.basicConfig(level=logging.INFO)
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+MAX_ZIP_SIZE = 19 * 1024 * 1024
 
-class CarouselGenerator:
-    def __init__(self, settings):
-        self.settings = settings
-        self.base_path = Path(__file__).parent
+CHOOSE_MODE, WAIT_FILE, WAIT_ARTIST, WAIT_TRACK, WAIT_LYRICS, CHOOSE_SIZE = range(6)
 
-    def get_font(self, font_type, size):
-        name = "Impact.ttf" if font_type == "impact" else "font.ttf"
-        path = self.base_path / "fonts" / name
-        if not path.exists(): path = self.base_path / name
-        try:
-            return ImageFont.truetype(str(path), size)
-        except:
-            return ImageFont.load_default()
+def get_cancel_kb():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data='cancel_conv')]])
 
-    def center_crop_square(self, img):
-        """Обрезает любое фото до квадрата 1:1"""
-        width, height = img.size
-        new_size = min(width, height)
-        left = (width - new_size) / 2
-        top = (height - new_size) / 2
-        right = (width + new_size) / 2
-        bottom = (height + new_size) / 2
-        return img.crop((left, top, right, bottom))
+# Сервер для Render
+class HealthCheck(BaseHTTPRequestHandler):
+    def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"OK")
+    def do_HEAD(self): self.send_response(200); self.end_headers()
+    def log_message(self, *args): pass
 
-    def shadow_centered(self, draw, text, font, color, cx, y):
-        """Рисование текста с тенью по центру (для Карусели)"""
-        bbox = draw.textbbox((0, 0), text, font=font)
-        tw = bbox[2] - bbox[0]
-        tx = cx - tw // 2
-        draw.text((tx+2, y+2), text, font=font, fill=(0, 0, 0, 120))
-        draw.text((tx, y), text, font=font, fill=color)
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    kb = [[InlineKeyboardButton("🎨 Карусель (TikTok Style)", callback_data='m_carousel')],
+          [InlineKeyboardButton("😎 Impact (Мемный стиль)", callback_data='m_impact')]]
+    text = "Выберите режим:"
+    if update.callback_query: await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb))
+    else: await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb))
+    return CHOOSE_MODE
 
-    def draw_impact_text(self, draw, text, font, size_px):
-        """Рисование текста с обводкой (для Impact)"""
-        w, h = size_px
-        lines = text.split('\n')
-        total_h = sum(draw.textbbox((0,0), l, font=font)[3] for l in lines) + (len(lines)*15)
-        curr_y = (h - total_h) // 2
-        for line in lines:
-            bbox = draw.textbbox((0,0), line, font=font)
-            line_w = bbox[2] - bbox[0]
-            line_h = bbox[3] - bbox[1]
-            x = (w - line_w) // 2
-            for o in [(-3,-3),(3,-3),(-3,3),(3,3),(0,-3),(0,3),(-3,0),(2,0)]:
-                draw.text((x+o[0], curr_y+o[1]), line, font=font, fill="black")
-            draw.text((x, curr_y), line, font=font, fill="white")
-            curr_y += line_h + 15
+async def mode_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    mode = query.data.replace('m_', '')
+    context.user_data['mode'] = mode
+    await query.edit_message_text(f"✅ Режим: {mode.upper()}\nПришлите фото или ZIP.", reply_markup=get_cancel_kb())
+    return WAIT_FILE
 
-    def make_carousel(self, image_bytes, artist, track, lyrics, original_name, mode="carousel"):
-        raw_img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        # Всегда сначала делаем квадрат
-        square_img = self.center_crop_square(raw_img)
+async def receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if msg.photo: fid, name, is_zip = msg.photo[-1].file_id, "img.jpg", False
+    elif msg.document: 
+        fid, name = msg.document.file_id, msg.document.file_name
+        is_zip = name.lower().endswith('.zip')
+    else: return WAIT_FILE
+    context.user_data.update({"fid": fid, "is_zip": is_zip, "name": name})
+    await msg.reply_text("👤 Имя артиста:", reply_markup=get_cancel_kb())
+    return WAIT_ARTIST
 
-        if mode == "impact":
-            # --- РЕЖИМ IMPACT (МЕМ) ---
-            img = square_img.resize((1080, 1080), Image.Resampling.LANCZOS)
-            f_main = self.get_font("impact", self.settings.get("font_size_slide1", 85))
-            f_lyr = self.get_font("impact", self.settings.get("font_size_slide2", 50))
-            
-            s1 = img.copy(); self.draw_impact_text(ImageDraw.Draw(s1), artist.upper(), f_main, (1080,1080))
-            s2 = img.copy(); self.draw_impact_text(ImageDraw.Draw(s2), lyrics.upper(), f_lyr, (1080,1080))
+async def got_artist(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['artist'] = update.message.text
+    # ПРОПУСК ТРЕКА ДЛЯ IMPACT
+    if context.user_data.get('mode') == 'impact':
+        context.user_data['track'] = "" 
+        await update.message.reply_text("📝 Введите текст:", reply_markup=get_cancel_kb())
+        return WAIT_LYRICS
+    await update.message.reply_text("🎵 Название трека:", reply_markup=get_cancel_kb())
+    return WAIT_TRACK
+
+async def got_track(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['track'] = update.message.text
+    await update.message.reply_text("📝 Текст лирики:", reply_markup=get_cancel_kb())
+    return WAIT_LYRICS
+
+async def got_lyrics(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['lyrics'] = update.message.text
+    kb = [[InlineKeyboardButton("S (Мелкий)", callback_data='s_45_30')],
+          [InlineKeyboardButton("M (Средний)", callback_data='s_80_50')],
+          [InlineKeyboardButton("L (Крупный)", callback_data='s_115_85')],
+          [InlineKeyboardButton("❌ Отмена", callback_data='cancel_conv')]]
+    await update.message.reply_text("Выберите размер текста:", reply_markup=InlineKeyboardMarkup(kb))
+    return CHOOSE_SIZE
+
+async def size_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    _, s1, s2 = query.data.split('_')
+    context.user_data['sizes'] = {'s1': int(s1), 's2': int(s2)}
+    await query.edit_message_text("⏳ Обработка начата...")
+    
+    ud = context.user_data
+    chat_id = update.effective_chat.id
+    try:
+        file = await context.bot.get_file(ud["fid"])
+        f_bytes = await file.download_as_bytearray()
+        gen = CarouselGenerator({"font_size_slide1": ud['sizes']['s1'], "font_size_slide2": ud['sizes']['s2'], "blur": 22, "text_color": "white"})
+
+        if not ud["is_zip"]:
+            b1, b2, n1, n2 = gen.make_carousel(f_bytes, ud["artist"], ud["track"], ud["lyrics"], ud["name"], ud['mode'])
+            await context.bot.send_document(chat_id, io.BytesIO(b1), filename=n1)
+            await context.bot.send_document(chat_id, io.BytesIO(b2), filename=n2)
         else:
-            # --- ВАШ ОСНОВНОЙ РЕЖИМ КАРУСЕЛИ ---
-            canvas = Image.new("RGB", (CANVAS_W, CANVAS_H), (30, 30, 30))
-            # Размытый фон
-            blur_bg = square_img.resize((CANVAS_W, CANVAS_H), Image.Resampling.LANCZOS)
-            blur_bg = blur_bg.filter(ImageFilter.GaussianBlur(self.settings.get("blur", 22)))
-            canvas.paste(blur_bg, (0, 0))
+            # Логика ZIP (дробление по 19МБ)
+            out_io = io.BytesIO(); cur_zip = zipfile.ZipFile(out_io, 'w'); p = 1
+            with zipfile.ZipFile(io.BytesIO(f_bytes)) as in_z:
+                imgs = [f for f in in_z.namelist() if f.lower().endswith(('.png', '.jpg', '.jpeg')) and not f.startswith('__')]
+                for f in imgs:
+                    b1, b2, n1, n2 = gen.make_carousel(in_z.read(f), ud["artist"], ud["track"], ud["lyrics"], f, ud['mode'])
+                    cur_zip.writestr(n1, b1); cur_zip.writestr(n2, b2)
+                    if out_io.tell() > MAX_ZIP_SIZE:
+                        cur_zip.close(); out_io.seek(0)
+                        await context.bot.send_document(chat_id, out_io, filename=f"part_{p}.zip")
+                        out_io = io.BytesIO(); cur_zip = zipfile.ZipFile(out_io, 'w'); p += 1
+            cur_zip.close()
+            if out_io.tell() > 100:
+                out_io.seek(0); await context.bot.send_document(chat_id, out_io, filename=f"part_{p}.zip")
+        await context.bot.send_message(chat_id, "✅ Готово! Нажми /start для нового круга.")
+    except Exception as e:
+        await context.bot.send_message(chat_id, f"❌ Ошибка: {e}")
+    return ConversationHandler.END
 
-            # Скругленное фото по центру
-            mask = Image.new("L", (PHOTO_SZ, PHOTO_SZ), 0)
-            draw_m = ImageDraw.Draw(mask)
-            draw_m.rounded_rectangle((0, 0, PHOTO_SZ, PHOTO_SZ), 50, fill=255)
-            photo = square_img.resize((PHOTO_SZ, PHOTO_SZ), Image.Resampling.LANCZOS).convert("RGBA")
-            photo.putalpha(mask)
-            canvas.paste(photo, (PHOTO_X, PHOTO_Y), photo)
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.callback_query: await update.callback_query.answer()
+    await (update.callback_query.message if update.callback_query else update.message).reply_text("❌ Отменено. Напишите /start")
+    context.user_data.clear()
+    return ConversationHandler.END
 
-            final_cv = canvas.convert("RGB")
-            draw = ImageDraw.Draw(final_cv)
-            color = self.settings.get("text_color", "white")
-            
-            # Текст Слайд 1 (Артист и Трек слева)
-            sz1 = self.settings.get("font_size_slide1", 78)
-            fnt_a = self.get_font("normal", sz1)
-            fnt_t = self.get_font("normal", max(14, sz1 - 20))
-            y1 = (CANVAS_H - (sz1 * 2 + 20)) // 2
-            self.shadow_centered(draw, artist, fnt_a, color, ARTIST_CX, y1)
-            self.shadow_centered(draw, track, fnt_t, color, ARTIST_CX, y1 + sz1 + 20)
+def main():
+    threading.Thread(target=lambda: HTTPServer(('0.0.0.0', int(os.environ.get("PORT", 8080))), HealthCheck).serve_forever(), daemon=True).start()
+    app = Application.builder().token(BOT_TOKEN).build()
+    conv = ConversationHandler(
+        entry_points=[CommandHandler("start", start)],
+        states={
+            CHOOSE_MODE: [CallbackQueryHandler(mode_chosen, pattern='^m_')],
+            WAIT_FILE:   [MessageHandler(filters.PHOTO | filters.Document.ALL, receive_file)],
+            WAIT_ARTIST: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_artist)],
+            WAIT_TRACK:  [MessageHandler(filters.TEXT & ~filters.COMMAND, got_track)],
+            WAIT_LYRICS: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_lyrics)],
+            CHOOSE_SIZE: [CallbackQueryHandler(size_chosen, pattern='^s_')],
+        },
+        fallbacks=[CommandHandler("cancel", cancel), CallbackQueryHandler(cancel, pattern='cancel_conv')]
+    )
+    app.add_handler(conv)
+    app.run_polling(drop_pending_updates=True)
 
-            # Текст Слайд 2 (Лирика справа)
-            sz2 = self.settings.get("font_size_slide2", 44)
-            fnt_l = self.get_font("normal", sz2)
-            lines = []
-            for line in lyrics.split('\n'): lines.extend(textwrap.wrap(line, width=22))
-            y2 = (CANVAS_H - (len(lines)*(sz2+15))) // 2
-            for line in lines:
-                self.shadow_centered(draw, line, fnt_l, color, FREE_ZONE_CX, y2)
-                y2 += sz2 + 15
-
-            s1 = final_cv.crop((0, 0, SLIDE_W, CANVAS_H))
-            s2 = final_cv.crop((SLIDE_W, 0, CANVAS_W, CANVAS_H))
-
-        out1, out2 = io.BytesIO(), io.BytesIO()
-        s1.save(out1, format="JPEG", quality=90)
-        s2.save(out2, format="JPEG", quality=90)
-        return out1.getvalue(), out2.getvalue(), f"{original_name}_1.jpg", f"{original_name}_2.jpg"
+if __name__ == "__main__": main()
