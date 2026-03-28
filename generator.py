@@ -28,6 +28,7 @@ class CarouselGenerator:
             return ImageFont.load_default()
 
     def center_crop_square(self, img):
+        """Обрезает любое фото до квадрата 1:1"""
         width, height = img.size
         new_size = min(width, height)
         left = (width - new_size) / 2
@@ -37,6 +38,7 @@ class CarouselGenerator:
         return img.crop((left, top, right, bottom))
 
     def shadow_centered(self, draw, text, font, color, cx, y):
+        """Рисование текста с тенью по центру (для Карусели)"""
         bbox = draw.textbbox((0, 0), text, font=font)
         tw = bbox[2] - bbox[0]
         tx = cx - tw // 2
@@ -44,6 +46,7 @@ class CarouselGenerator:
         draw.text((tx, y), text, font=font, fill=color)
 
     def draw_impact_text(self, draw, text, font, size_px):
+        """Рисование текста с обводкой (для Impact)"""
         w, h = size_px
         lines = text.split('\n')
         total_h = sum(draw.textbbox((0,0), l, font=font)[3] for l in lines) + (len(lines)*15)
@@ -60,23 +63,26 @@ class CarouselGenerator:
 
     def make_carousel(self, image_bytes, artist, track, lyrics, original_name, mode="carousel"):
         raw_img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        # Всегда сначала делаем квадрат
         square_img = self.center_crop_square(raw_img)
 
         if mode == "impact":
+            # --- РЕЖИМ IMPACT (МЕМ) ---
             img = square_img.resize((1080, 1080), Image.Resampling.LANCZOS)
             f_main = self.get_font("impact", self.settings.get("font_size_slide1", 85))
-            # Слайд 2: размер уменьшен на 40%
-            sz2 = int(self.settings.get("font_size_slide2", 35) * 0.6)
-            f_lyr = self.get_font("impact", sz2)
-
+            f_lyr = self.get_font("impact", self.settings.get("font_size_slide2", 35))
+            
             s1 = img.copy(); self.draw_impact_text(ImageDraw.Draw(s1), artist.upper(), f_main, (1080,1080))
             s2 = img.copy(); self.draw_impact_text(ImageDraw.Draw(s2), lyrics.upper(), f_lyr, (1080,1080))
         else:
+            # --- ВАШ ОСНОВНОЙ РЕЖИМ КАРУСЕЛИ ---
             canvas = Image.new("RGB", (CANVAS_W, CANVAS_H), (30, 30, 30))
+            # Размытый фон
             blur_bg = square_img.resize((CANVAS_W, CANVAS_H), Image.Resampling.LANCZOS)
             blur_bg = blur_bg.filter(ImageFilter.GaussianBlur(self.settings.get("blur", 22)))
             canvas.paste(blur_bg, (0, 0))
 
+            # Скругленное фото по центру
             mask = Image.new("L", (PHOTO_SZ, PHOTO_SZ), 0)
             draw_m = ImageDraw.Draw(mask)
             draw_m.rounded_rectangle((0, 0, PHOTO_SZ, PHOTO_SZ), 50, fill=255)
@@ -87,8 +93,8 @@ class CarouselGenerator:
             final_cv = canvas.convert("RGB")
             draw = ImageDraw.Draw(final_cv)
             color = self.settings.get("text_color", "white")
-
-            # Слайд 1: артист и трек
+            
+            # Текст Слайд 1 (Артист и Трек слева)
             sz1 = self.settings.get("font_size_slide1", 78)
             fnt_a = self.get_font("normal", sz1)
             fnt_t = self.get_font("normal", max(14, sz1 - 20))
@@ -96,8 +102,8 @@ class CarouselGenerator:
             self.shadow_centered(draw, artist, fnt_a, color, ARTIST_CX, y1)
             self.shadow_centered(draw, track, fnt_t, color, ARTIST_CX, y1 + sz1 + 20)
 
-            # Слайд 2: лирика — размер уменьшен на 40%
-            sz2 = int(self.settings.get("font_size_slide2", 44) * 0.6)
+            # Текст Слайд 2 (Лирика справа)
+            sz2 = self.settings.get("font_size_slide2", 44)
             fnt_l = self.get_font("normal", sz2)
             lines = []
             for line in lyrics.split('\n'): lines.extend(textwrap.wrap(line, width=22))
