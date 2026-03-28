@@ -70,7 +70,7 @@ class CarouselGenerator:
             # --- РЕЖИМ IMPACT (МЕМ) ---
             img = square_img.resize((1080, 1080), Image.Resampling.LANCZOS)
             f_main = self.get_font("impact", self.settings.get("font_size_slide1", 85))
-            f_lyr = self.get_font("impact", self.settings.get("font_size_slide2", 50))
+            f_lyr = self.get_font("impact", self.settings.get("font_size_slide2", 35))
             
             s1 = img.copy(); self.draw_impact_text(ImageDraw.Draw(s1), artist.upper(), f_main, (1080,1080))
             s2 = img.copy(); self.draw_impact_text(ImageDraw.Draw(s2), lyrics.upper(), f_lyr, (1080,1080))
